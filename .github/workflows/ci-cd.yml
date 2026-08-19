@@ -21,7 +21,14 @@ permissions:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  # Always true, not just for pull_request — a run parked at deploy-prod's
+  # required-reviewer gate counts as "in progress" for as long as it sits
+  # unapproved, which could be indefinitely. Without cancel-in-progress here,
+  # that silently queues every subsequent push to main behind it forever,
+  # since they share this concurrency group. A newer push superseding an
+  # older run's pending prod approval is the right behavior anyway — you
+  # want the latest commit's deploy gated, not a stale one's.
+  cancel-in-progress: true
 
 jobs:
   test:
