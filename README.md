@@ -26,13 +26,20 @@ standing behind them change.
 
 | | Local | DEV (Azure) | PROD (Azure) |
 |---|---|---|---|
-| How | `docker compose up --build` | Azure Container Apps | Azure Container Apps |
-| Database | Postgres container | Azure PostgreSQL Flexible Server (public, Azure-services-only firewall) | Azure PostgreSQL Flexible Server (private/VNet) |
-| Secrets | `.env` file (gitignored) | Azure Key Vault, read via managed identity | Azure Key Vault, read via managed identity |
-| Image | built locally | Azure Container Registry | Azure Container Registry (promoted DEV image, not a fresh build) |
+| How | `docker compose up --build` | Azure Container Apps (shared `rg-commerce-dev`) | Azure Container Apps |
+| Database | Postgres container | shared Azure PostgreSQL Flexible Server, this app's own database | Azure PostgreSQL Flexible Server (private/VNet), own database |
+| Secrets | `.env` file (gitignored) | shared Azure Key Vault, this app's own namespaced secret, read via managed identity | Azure Key Vault, read via managed identity |
+| Image | built locally | shared Azure Container Registry | Azure Container Registry (promoted DEV image, not a fresh build) |
 | Replicas | 1 (single container) | min 1 / max 3 | higher min, autoscale rules |
 | Logs | console (or JSON with `LOG_JSON=true`) | JSON → Log Analytics / App Insights | JSON → Log Analytics / App Insights |
 | Status | — | see [Deploying to Azure (DEV)](#deploying-to-azure-dev) | **not yet provisioned** — see [Deploying to Azure (PROD)](#deploying-to-azure-prod) |
+
+DEV's infrastructure (`rg-commerce-dev`) is **shared platform infrastructure**,
+not owned by this repo — the same registry, Key Vault, Postgres server, and
+Container Apps environment also host `commerce-operations-api`, a sibling
+service. This repo only owns and deploys its own Container App
+(`commerce-intelligence-api`) into that shared environment; see
+[Deploying to Azure (DEV)](#deploying-to-azure-dev).
 
 ## Quickstart (Docker Compose)
 
@@ -165,7 +172,7 @@ tests/          unit/ (no DB), integration/ (needs Postgres), smoke/ (needs a
                 running deployment) — the latter two skip cleanly if absent
 docker/         Dockerfiles for the api and ui images
 docker-compose.yml
-infra/          Bicep templates for Azure (base.bicep + app.bicep, each with parameters) + GitHub OIDC setup script
+infra/          Bicep template for this app's own Container App (app.bicep + parameters) + GitHub OIDC setup script
 .github/        CI/CD workflow (ci-cd.yml): test on every push/PR, build+push+deploy on push to main
 docs/           architecture.md, api.md
 ```
@@ -195,58 +202,49 @@ profitability — can be filtered by a single field. See
 
 Same image, same app — deployed onto Azure Container Apps instead of Compose.
 No application code changes; only environment variables and where secrets come
-from differ. Infrastructure is defined in two Bicep templates — that's the
-source of truth; what follows is the narrative summary:
+from differ.
 
-- [`infra/base.bicep`](infra/base.bicep) — everything except the app itself
-  (registry, database, vault, identity, logging). Deploy once; redeploy only
-  when infra changes.
-- [`infra/app.bicep`](infra/app.bicep) — the Container App. Deploy every time
-  a new image is pushed.
+`rg-commerce-dev` is **shared platform infrastructure** — provisioned and
+owned outside this repo, hosting more than one service
+(`commerce-operations-api` sits in it too, alongside its own database,
+identity, and Key Vault secret). This repo has exactly one thing to deploy:
+its own Container App. [`infra/app.bicep`](infra/app.bicep) does only that —
+every other resource it touches (registry, Key Vault, the shared Postgres
+server, the Container Apps environment, this app's own managed identity) is
+referenced as `existing`, never created, never modified. There is no
+`base.bicep` here, deliberately — provisioning shared infrastructure another
+service also depends on isn't this repo's job.
 
-They're split because the Container App needs an image to already exist in
-the registry `base.bicep` creates — one combined template can't bootstrap
-both on a first-ever deploy.
+**Shared resources this deploys into** (already provisioned by the platform):
 
-**Resources** (all in one resource group, one region):
-
-| Resource | Purpose |
+| Resource | Name |
 |---|---|
-| Azure Container Registry (Basic) | holds the built image |
-| Azure Container Apps Environment (Consumption) | hosts the app |
-| Azure Container App | runs `docker/api.Dockerfile`'s image |
-| Azure Database for PostgreSQL Flexible Server (Burstable B1ms) | the app's database |
-| Azure Key Vault (RBAC-authorized) | holds `database-url` — nothing else is secret |
-| User-assigned managed identity | `AcrPull` on the registry, `Key Vault Secrets User` on the vault — this is how the Container App authenticates to both, with **no stored credentials anywhere** |
-| Log Analytics workspace + Application Insights | the Container Apps environment ships stdout/stderr here automatically (`ContainerAppConsoleLogs_CL`) — since the app already logs structured JSON (`LOG_JSON=true`), those logs land pre-structured, no extra app-side instrumentation needed |
+| Resource group | `rg-commerce-dev` |
+| Container Registry | `acrcommercedevzqbs3z` |
+| Container Apps Environment | `cae-commerce-dev` |
+| Key Vault | `kv-commerce-dev-zqbs3z` — this app's secret: `commerce-intelligence-database-url` |
+| Managed identity | `id-commerce-intelligence-api` — already granted `AcrPull` (registry) and `Key Vault Secrets User` (vault) by the platform |
+| Log Analytics + Application Insights | `log-commerce-dev` / `appi-commerce-dev` |
+
+**This repo's own resource:**
+
+| Resource | Name |
+|---|---|
+| Container App | `commerce-intelligence-api` — the platform provisions it with a placeholder image; `app.bicep` updates it in place with the real one |
 
 **Deploy:**
 
 ```bash
 az login
-RG=rg-commerce   # must already exist
-az provider register -n Microsoft.App
-az provider register -n Microsoft.OperationalInsights
-az provider register -n Microsoft.Insights
-az provider register -n Microsoft.ContainerRegistry
-az provider register -n Microsoft.DBforPostgreSQL
-az provider register -n Microsoft.KeyVault
+RG=rg-commerce-dev
 
-# 1. Infra — registry, database, vault, identity, logging. Once; re-run only
-#    when infra itself changes.
-az deployment group create -g $RG -f infra/base.bicep \
-  -p infra/base.parameters.dev.json \
-  postgresAdminPassword='<generate-a-strong-password-do-not-commit-it>'
-
-# 2. Build and push the image, now that the registry exists.
 docker build -f docker/api.Dockerfile -t commerce-intelligence-api:0.1.0 .
-ACR=$(az deployment group show -g $RG -n base --query properties.outputs.acrLoginServer.value -o tsv)
-az acr login --name "${ACR%%.*}"
-docker tag commerce-intelligence-api:0.1.0 $ACR/commerce-intelligence-api:0.1.0
-docker push $ACR/commerce-intelligence-api:0.1.0
+az acr login --name acrcommercedevzqbs3z
+docker tag commerce-intelligence-api:0.1.0 acrcommercedevzqbs3z.azurecr.io/commerce-intelligence-api:0.1.0
+docker push acrcommercedevzqbs3z.azurecr.io/commerce-intelligence-api:0.1.0
 
-# 3. The app — every time a new image is pushed, re-run just this one.
-az deployment group create -g $RG -f infra/app.bicep -p infra/app.parameters.dev.json
+az deployment group create -g $RG -f infra/app.bicep -p infra/app.parameters.dev.json \
+  imageTag=0.1.0 --name app
 ```
 
 Migrations run automatically — the image's `CMD` is `alembic upgrade head &&
@@ -264,34 +262,21 @@ SMOKE_BASE_URL="https://$FQDN" pytest -m smoke
 Structured logs are queryable in Log Analytics immediately:
 
 ```bash
-WORKSPACE=$(az deployment group show -g $RG -n base --query properties.outputs.logAnalyticsWorkspaceName.value -o tsv)
-CUSTOMER_ID=$(az monitor log-analytics workspace show -g $RG -n $WORKSPACE --query customerId -o tsv)
+CUSTOMER_ID=$(az monitor log-analytics workspace show -g $RG -n log-commerce-dev --query customerId -o tsv)
 az monitor log-analytics query --workspace $CUSTOMER_ID --analytics-query \
-  "ContainerAppConsoleLogs_CL | order by TimeGenerated desc | take 20"
+  "ContainerAppConsoleLogs_CL | where ContainerAppName_s == 'commerce-intelligence-api' | order by TimeGenerated desc | take 20"
 ```
 
-One config step both templates deliberately leave out — its ARM schema is
-still preview/evolving, so it's a manual post-deploy command instead of
-something pinned in Bicep:
+**Tear down** just this app, leaving every shared resource (and
+`commerce-operations-api`) untouched:
 
 ```bash
-CONN_STRING=$(az deployment group show -g $RG -n base --query properties.outputs.appInsightsConnectionString.value -o tsv)
-CAE=$(az deployment group show -g $RG -n base --query properties.outputs.containerAppEnvName.value -o tsv)
-az containerapp env telemetry app-insights set -g $RG -n $CAE --connection-string $CONN_STRING
+az containerapp delete -g $RG -n commerce-intelligence-api --yes
 ```
 
-**Tear down** the app/environment without touching Postgres or Key Vault:
-
-```bash
-CAN=$(az deployment group show -g $RG -n app --query properties.outputs.containerAppName.value -o tsv)
-CAE=$(az deployment group show -g $RG -n base --query properties.outputs.containerAppEnvName.value -o tsv)
-az containerapp delete -g $RG -n $CAN --yes
-az containerapp env delete -g $RG -n $CAE --yes
-```
-
-Since everything's defined in the templates, standing it back up later is
-just re-running the two `az deployment group create` commands above — no
-need to reconstruct anything by hand.
+Standing it back up is re-running the `az deployment group create` command
+above — the platform recreates the Container App with a placeholder image if
+it's ever deleted, or you redeploy it directly the same way.
 
 ## CI/CD
 
@@ -307,14 +292,22 @@ itself can create — that's a manual step in this repo's own Settings).
 
 ```bash
 GITHUB_OWNER=<org-or-user> GITHUB_REPO=<repo-name> \
-RESOURCE_GROUP=rg-commerce ACR_NAME=acrcommerceintel1dc549 \
+RESOURCE_GROUP=rg-commerce-dev ACR_NAME=acrcommercedevzqbs3z \
+CONTAINER_APP_NAME=commerce-intelligence-api \
 ./infra/setup-github-oidc.sh
 ```
 
 This creates an Azure AD app registration trusted via OIDC federated
-credentials (no client secret stored anywhere) with `AcrPush` on the registry
-and `Contributor` on the resource group, and prints the exact GitHub repo
-secrets/variables to set from its output. Then, in the repo's Settings:
+credentials (no client secret stored anywhere). Since `rg-commerce-dev` is
+shared with `commerce-operations-api`, the grant is scoped as narrowly as
+Azure allows: `Reader` on the resource group (so Bicep's `existing` lookups
+and `az deployment group show` work), `AcrPush` on the registry (push-only;
+ACR has no per-repository scoping to narrow further), and
+`Container Apps Contributor` scoped to just the `commerce-intelligence-api`
+Container App — this identity can never touch `commerce-operations-api`, the
+shared Postgres server, Key Vault, or storage account. The script prints the
+exact GitHub repo secrets/variables to set from its output. Then, in the
+repo's Settings:
 
 - **Environments** → create `dev` (no protection rules) and `production`
   (add required reviewers — this is the manual-approval gate).
@@ -357,4 +350,3 @@ and config differ from DEV, never application code:
 - **DEV Postgres is publicly reachable** (scoped to Azure services, not the
   open internet, but still not VNet-isolated) — acceptable for DEV, not for
   PROD.
-# cax-commerce-intelligence

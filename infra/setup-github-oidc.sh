@@ -3,20 +3,39 @@
 # OIDC (azure/login) — no client secret stored anywhere, GitHub and Azure AD
 # trust each other's tokens directly for this one app registration.
 #
+# rg-commerce-dev is a SHARED resource group (commerce-operations-api and its
+# own infra live in it too), so this deliberately grants the narrowest scope
+# that works: Reader on the resource group (needed for Bicep `existing`
+# lookups and `az deployment group show`), Container Apps Contributor scoped
+# to just this app's own Container App (not the whole environment or any
+# other service's), and AcrPush on the shared registry (push-only, and the
+# registry has no per-repository scoping to narrow further). This identity
+# can never touch commerce-operations-api, the shared Postgres server, Key
+# Vault, or storage account.
+#
 # Run once per repo, after the GitHub repository exists (the federated
 # credentials below are scoped to its exact owner/name).
 #
 # Usage:
 #   GITHUB_OWNER=<org-or-user> GITHUB_REPO=<repo-name> \
-#   RESOURCE_GROUP=rg-commerce ACR_NAME=acrcommerceintel1dc549 \
+#   RESOURCE_GROUP=rg-commerce-dev ACR_NAME=acrcommercedevzqbs3z \
+#   CONTAINER_APP_NAME=commerce-intelligence-api \
 #   ./infra/setup-github-oidc.sh
 
 set -euo pipefail
 
+# On Git Bash for Windows, MSYS auto-converts leading-slash arguments (like
+# Azure resource IDs — "/subscriptions/...") into Windows paths before az.cmd
+# ever sees them, silently corrupting every --scope value below and making
+# `az role assignment create` fail with a confusing "MissingSubscription"
+# error. Harmless no-op on Linux/macOS bash and real MSYS builds of bash.
+export MSYS_NO_PATHCONV=1
+
 : "${GITHUB_OWNER:?Set GITHUB_OWNER (the GitHub org or user that owns the repo)}"
 : "${GITHUB_REPO:?Set GITHUB_REPO (repo name only, no owner prefix)}"
-: "${RESOURCE_GROUP:?Set RESOURCE_GROUP (the DEV resource group, e.g. rg-commerce)}"
-: "${ACR_NAME:?Set ACR_NAME (e.g. acrcommerceintel1dc549)}"
+: "${RESOURCE_GROUP:?Set RESOURCE_GROUP (e.g. rg-commerce-dev)}"
+: "${ACR_NAME:?Set ACR_NAME (e.g. acrcommercedevzqbs3z)}"
+CONTAINER_APP_NAME="${CONTAINER_APP_NAME:-commerce-intelligence-api}"
 
 APP_NAME="commerce-intelligence-github-actions"
 SUBSCRIPTION_ID=$(az account show --query id -o tsv)
@@ -57,14 +76,35 @@ create_fic "main-branch"        "repo:${GITHUB_OWNER}/${GITHUB_REPO}:ref:refs/he
 create_fic "dev-environment"    "repo:${GITHUB_OWNER}/${GITHUB_REPO}:environment:dev"
 create_fic "prod-environment"   "repo:${GITHUB_OWNER}/${GITHUB_REPO}:environment:production"
 
-echo "=== RBAC ==="
+echo "=== RBAC (scoped to this app only — rg-commerce-dev is shared) ==="
+# --assignee-object-id + --assignee-principal-type (not --assignee <appId>) —
+# the appId form routes through a Graph lookup that has proven unreliable
+# from some shells/environments; resolving the SP's object id ourselves and
+# passing it directly avoids that entirely.
+SP_OBJECT_ID=$(az ad sp show --id "$APP_ID" --query id -o tsv)
+RG_ID="/subscriptions/${SUBSCRIPTION_ID}/resourceGroups/${RESOURCE_GROUP}"
 ACR_ID=$(az acr show -g "$RESOURCE_GROUP" -n "$ACR_NAME" --query id -o tsv)
-az role assignment create --role AcrPush --assignee "$APP_ID" --scope "$ACR_ID" -o none || echo "  AcrPush already assigned"
-# Contributor on the resource group is the pragmatic starting point (matches
-# the access level used to deploy this by hand in earlier phases) — tighten
-# to a scoped custom role once the release process matures, per the Phase 3
-# brief's own wording.
-az role assignment create --role Contributor --assignee "$APP_ID" --scope "/subscriptions/${SUBSCRIPTION_ID}/resourceGroups/${RESOURCE_GROUP}" -o none || echo "  Contributor already assigned"
+CONTAINER_APP_ID=$(az containerapp show -g "$RESOURCE_GROUP" -n "$CONTAINER_APP_NAME" --query id -o tsv)
+
+# A real failure must surface, not just get swallowed as "must already
+# exist" — only the specific RoleAssignmentExists condition is actually
+# benign here.
+assign_role() {
+  local role=$1 scope=$2
+  local output
+  if output=$(az role assignment create --role "$role" --assignee-object-id "$SP_OBJECT_ID" --assignee-principal-type ServicePrincipal --scope "$scope" 2>&1); then
+    echo "  granted $role"
+  elif echo "$output" | grep -q "RoleAssignmentExists"; then
+    echo "  $role already assigned"
+  else
+    echo "  FAILED to grant $role:" >&2
+    echo "$output" >&2
+    exit 1
+  fi
+}
+assign_role "Reader" "$RG_ID"
+assign_role "AcrPush" "$ACR_ID"
+assign_role "Container Apps Contributor" "$CONTAINER_APP_ID"
 
 ACR_LOGIN_SERVER=$(az acr show -g "$RESOURCE_GROUP" -n "$ACR_NAME" --query loginServer -o tsv)
 
@@ -81,7 +121,6 @@ Settings -> Secrets and variables -> Actions -> Variables:
   ACR_NAME               $ACR_NAME
   ACR_LOGIN_SERVER       $ACR_LOGIN_SERVER
   AZURE_RESOURCE_GROUP   $RESOURCE_GROUP
-  UNIQUE_SUFFIX           <the uniqueSuffix base.bicep was deployed with>
 
 Settings -> Environments:
   "dev"          — no protection rules needed (auto-deploys on merge to main)

@@ -103,9 +103,7 @@ jobs:
       - run: |
           az deployment group create -g ${{ vars.AZURE_RESOURCE_GROUP }} -f infra/app.bicep \
             -p infra/app.parameters.dev.json \
-            imageTag=${{ needs.build-and-push.outputs.image-tag }} \
-            uniqueSuffix=${{ vars.UNIQUE_SUFFIX }} \
-            acrNameOverride=${{ vars.ACR_NAME }}
+            imageTag=${{ needs.build-and-push.outputs.image-tag }}
 
       - run: |
           FQDN=$(az deployment group show -g ${{ vars.AZURE_RESOURCE_GROUP }} -n app --query properties.outputs.containerAppFqdn.value -o tsv)
@@ -143,6 +141,4 @@ jobs:
         run: |
           az deployment group create -g ${{ vars.PROD_AZURE_RESOURCE_GROUP }} -f infra/app.bicep \
             -p infra/app.parameters.prod.json \
-            imageTag=${{ needs.build-and-push.outputs.image-tag }} \
-            uniqueSuffix=${{ vars.PROD_UNIQUE_SUFFIX }} \
-            acrNameOverride=${{ vars.ACR_NAME }}
+            imageTag=${{ needs.build-and-push.outputs.image-tag }}
