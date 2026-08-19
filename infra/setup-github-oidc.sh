@@ -3,20 +3,32 @@
 # OIDC (azure/login) — no client secret stored anywhere, GitHub and Azure AD
 # trust each other's tokens directly for this one app registration.
 #
+# rg-commerce-dev is a SHARED resource group (commerce-operations-api and its
+# own infra live in it too), so this deliberately grants the narrowest scope
+# that works: Reader on the resource group (needed for Bicep `existing`
+# lookups and `az deployment group show`), Container Apps Contributor scoped
+# to just this app's own Container App (not the whole environment or any
+# other service's), and AcrPush on the shared registry (push-only, and the
+# registry has no per-repository scoping to narrow further). This identity
+# can never touch commerce-operations-api, the shared Postgres server, Key
+# Vault, or storage account.
+#
 # Run once per repo, after the GitHub repository exists (the federated
 # credentials below are scoped to its exact owner/name).
 #
 # Usage:
 #   GITHUB_OWNER=<org-or-user> GITHUB_REPO=<repo-name> \
-#   RESOURCE_GROUP=rg-commerce ACR_NAME=acrcommerceintel1dc549 \
+#   RESOURCE_GROUP=rg-commerce-dev ACR_NAME=acrcommercedevzqbs3z \
+#   CONTAINER_APP_NAME=commerce-intelligence-api \
 #   ./infra/setup-github-oidc.sh
 
 set -euo pipefail
 
 : "${GITHUB_OWNER:?Set GITHUB_OWNER (the GitHub org or user that owns the repo)}"
 : "${GITHUB_REPO:?Set GITHUB_REPO (repo name only, no owner prefix)}"
-: "${RESOURCE_GROUP:?Set RESOURCE_GROUP (the DEV resource group, e.g. rg-commerce)}"
-: "${ACR_NAME:?Set ACR_NAME (e.g. acrcommerceintel1dc549)}"
+: "${RESOURCE_GROUP:?Set RESOURCE_GROUP (e.g. rg-commerce-dev)}"
+: "${ACR_NAME:?Set ACR_NAME (e.g. acrcommercedevzqbs3z)}"
+CONTAINER_APP_NAME="${CONTAINER_APP_NAME:-commerce-intelligence-api}"
 
 APP_NAME="commerce-intelligence-github-actions"
 SUBSCRIPTION_ID=$(az account show --query id -o tsv)
@@ -57,14 +69,14 @@ create_fic "main-branch"        "repo:${GITHUB_OWNER}/${GITHUB_REPO}:ref:refs/he
 create_fic "dev-environment"    "repo:${GITHUB_OWNER}/${GITHUB_REPO}:environment:dev"
 create_fic "prod-environment"   "repo:${GITHUB_OWNER}/${GITHUB_REPO}:environment:production"
 
-echo "=== RBAC ==="
+echo "=== RBAC (scoped to this app only — rg-commerce-dev is shared) ==="
+RG_ID="/subscriptions/${SUBSCRIPTION_ID}/resourceGroups/${RESOURCE_GROUP}"
 ACR_ID=$(az acr show -g "$RESOURCE_GROUP" -n "$ACR_NAME" --query id -o tsv)
+CONTAINER_APP_ID=$(az containerapp show -g "$RESOURCE_GROUP" -n "$CONTAINER_APP_NAME" --query id -o tsv)
+
+az role assignment create --role Reader --assignee "$APP_ID" --scope "$RG_ID" -o none || echo "  Reader already assigned"
 az role assignment create --role AcrPush --assignee "$APP_ID" --scope "$ACR_ID" -o none || echo "  AcrPush already assigned"
-# Contributor on the resource group is the pragmatic starting point (matches
-# the access level used to deploy this by hand in earlier phases) — tighten
-# to a scoped custom role once the release process matures, per the Phase 3
-# brief's own wording.
-az role assignment create --role Contributor --assignee "$APP_ID" --scope "/subscriptions/${SUBSCRIPTION_ID}/resourceGroups/${RESOURCE_GROUP}" -o none || echo "  Contributor already assigned"
+az role assignment create --role "Container Apps Contributor" --assignee "$APP_ID" --scope "$CONTAINER_APP_ID" -o none || echo "  Container Apps Contributor already assigned"
 
 ACR_LOGIN_SERVER=$(az acr show -g "$RESOURCE_GROUP" -n "$ACR_NAME" --query loginServer -o tsv)
 
@@ -81,7 +93,6 @@ Settings -> Secrets and variables -> Actions -> Variables:
   ACR_NAME               $ACR_NAME
   ACR_LOGIN_SERVER       $ACR_LOGIN_SERVER
   AZURE_RESOURCE_GROUP   $RESOURCE_GROUP
-  UNIQUE_SUFFIX           <the uniqueSuffix base.bicep was deployed with>
 
 Settings -> Environments:
   "dev"          — no protection rules needed (auto-deploys on merge to main)

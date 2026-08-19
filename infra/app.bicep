@@ -1,21 +1,22 @@
-// Commerce Intelligence — the Container App itself. Deploy infra/base.bicep
-// first (once; re-run only when infra changes); deploy this one every time a
-// new image is pushed. See infra/base.bicep for why these are split.
+// Commerce Intelligence — deploys this repo's own Container App into the
+// shared "commerce-platform" infrastructure that already exists in
+// rg-commerce-dev (ACR, Key Vault, Postgres, the Container Apps environment,
+// and this app's own managed identity — all provisioned and RBAC'd outside
+// this repo, by whatever stood up the platform). This template only ever
+// touches its own commerce-intelligence-api Container App; every other
+// resource is referenced `existing`, never created or modified — this repo
+// has no business owning shared infrastructure another service
+// (commerce-operations-api, sitting in the same resource group) also
+// depends on.
 //
 // Deploy:
-//   az deployment group create -g <resource-group> -f infra/app.bicep \
-//     -p infra/app.parameters.dev.json
+//   az deployment group create -g rg-commerce-dev -f infra/app.bicep \
+//     -p infra/app.parameters.dev.json imageTag=<tag>
 
-@description('Short environment name — must match what base.bicep was deployed with.')
-param environmentName string = 'dev'
-
-@description('Azure region.')
+@description('Azure region — must match the region the shared infrastructure runs in.')
 param location string = resourceGroup().location
 
-@description('Name prefix — must match what base.bicep was deployed with.')
-param namePrefix string = 'commerce'
-
-@description('Container image tag to deploy. Build and push it to the ACR from base.bicep first (see README.md).')
+@description('Container image tag to deploy. Build and push it to the shared ACR first (see README.md).')
 param imageTag string = 'latest'
 
 @description('Container App min replicas. 1 avoids cold starts on health checks/demos; 0 saves more but adds latency on the first request after idle.')
@@ -24,24 +25,30 @@ param minReplicas int = 1
 @description('Container App max replicas.')
 param maxReplicas int = 3
 
-@description('Suffix for globally-unique resource names — must match the value base.bicep was deployed with (see its uniqueSuffix parameter description).')
-@minLength(5)
-@maxLength(13)
-param uniqueSuffix string = uniqueString(resourceGroup().id)
+@description('This Container App name — must already exist (the platform provisions it with a placeholder image; this template updates it in place, never creates it fresh).')
+param containerAppName string = 'commerce-intelligence-api'
 
-@description('Must match the acrNameOverride base.bicep was deployed with, if any. Leave empty otherwise.')
-param acrNameOverride string = ''
+@description('Shared Container Apps environment name.')
+param containerAppEnvName string = 'cae-commerce-dev'
 
-@description('Tags applied to the resource.')
+@description('Shared Container Registry name.')
+param acrName string = 'acrcommercedevzqbs3z'
+
+@description('Shared Key Vault name.')
+param keyVaultName string = 'kv-commerce-dev-zqbs3z'
+
+@description('Key Vault secret holding this app DATABASE_URL — namespaced per-service since the Key Vault is shared (commerce-operations-api has its own alongside it).')
+param databaseUrlSecretName string = 'commerce-intelligence-database-url'
+
+@description('User-assigned managed identity name for this app — must already exist, with AcrPull + Key Vault Secrets User already granted by the platform.')
+param identityName string = 'id-commerce-intelligence-api'
+
+@description('Tags — matches what the platform already applies to this Container App, so this deployment does not drift them.')
 param tags object = {
-  project: 'commerce-intelligence'
-  environment: environmentName
+  application: 'commerce-platform'
+  environment: 'dev'
+  'managed-by': 'bicep'
 }
-var acrName = empty(acrNameOverride) ? toLower('${namePrefix}acr${uniqueSuffix}') : acrNameOverride
-var keyVaultName = toLower('kv-${namePrefix}-${uniqueSuffix}')
-var containerAppEnvName = 'cae-${namePrefix}-${environmentName}'
-var identityName = 'id-${namePrefix}-api-${environmentName}'
-var containerAppName = 'ca-${namePrefix}-api-${environmentName}'
 
 resource acr 'Microsoft.ContainerRegistry/registries@2023-07-01' existing = {
   name: acrName
@@ -53,7 +60,7 @@ resource keyVault 'Microsoft.KeyVault/vaults@2023-07-01' existing = {
 
 resource databaseUrlSecret 'Microsoft.KeyVault/vaults/secrets@2023-07-01' existing = {
   parent: keyVault
-  name: 'database-url'
+  name: databaseUrlSecretName
 }
 
 resource containerAppEnv 'Microsoft.App/managedEnvironments@2024-03-01' existing = {
@@ -149,12 +156,6 @@ resource containerApp 'Microsoft.App/containerApps@2024-03-01' = {
     }
   }
 }
-
-// Environment-level telemetry export to App Insights (Container Apps' own
-// OTel collector, not an app-side SDK) is a separate, still-evolving preview
-// API surface (`az containerapp env telemetry app-insights set`). Left as a
-// documented post-deploy step in README.md rather than encoded here, since
-// its ARM schema isn't stable enough yet to pin confidently in this template.
 
 output containerAppName string = containerApp.name
 output containerAppFqdn string = containerApp.properties.configuration.ingress.fqdn
