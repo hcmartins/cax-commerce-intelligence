@@ -105,10 +105,20 @@ jobs:
             -p infra/app.parameters.dev.json \
             imageTag=${{ needs.build-and-push.outputs.image-tag }}
 
-      - run: |
+      - name: Verify health/readiness (retries — a fresh revision needs a moment to start)
+        run: |
           FQDN=$(az deployment group show -g ${{ vars.AZURE_RESOURCE_GROUP }} -n app --query properties.outputs.containerAppFqdn.value -o tsv)
           echo "Deployed: https://$FQDN"
-          curl -sf "https://$FQDN/health" && curl -sf "https://$FQDN/ready"
+          for i in $(seq 1 12); do
+            if curl -sf "https://$FQDN/health" && curl -sf "https://$FQDN/ready"; then
+              echo "Healthy and ready."
+              exit 0
+            fi
+            echo "Not ready yet (attempt $i/12), retrying in 10s..."
+            sleep 10
+          done
+          echo "::error::Container App never became healthy/ready after deployment."
+          exit 1
 
   deploy-prod:
     needs: deploy-dev
