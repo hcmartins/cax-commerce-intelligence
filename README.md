@@ -101,12 +101,20 @@ Requires Python 3.11+ and a running Postgres.
 cp .env.example .env               # edit DATABASE_URL if not using the defaults
 pip install -e ".[dev,ui]"
 
-alembic upgrade head               # create the schema
-uvicorn app.main:app --reload      # API on :8000
+alembic upgrade head                       # create the schema
+python -m uvicorn app.main:app --reload    # API on :8000
 
 # in another terminal
-streamlit run ui/app.py            # dashboard on :8501
+python -m streamlit run ui/app.py          # dashboard on :8501
 ```
+
+`python -m <tool>` (rather than the bare `uvicorn`/`streamlit` commands) sidesteps a
+real, fairly common issue on Windows: pip installs a console-script `.exe` per
+package, but not every Python install/package manager combination puts (or
+keeps) all of them on `PATH` — `streamlit.exe` in particular can end up
+installed but unreachable as a bare command even though `uvicorn`/`alembic`
+work fine side by side. `python -m` always finds it, since it goes through
+the interpreter that has the package importable rather than through `PATH`.
 
 Then verify the API's up: `curl http://localhost:8000/health` and
 `curl http://localhost:8000/ready`.
@@ -288,7 +296,10 @@ automatically, to PROD only after a required reviewer approves (a GitHub
 Environment protection rule on `production`, not something the workflow file
 itself can create — that's a manual step in this repo's own Settings).
 
-**One-time setup**, once this repo exists on GitHub:
+**One-time setup**, once this repo exists on GitHub (needs `az` logged in and
+`gh` authenticated — the script uses `gh api` to resolve the repo's stable
+numeric IDs, which GitHub's OIDC subject claim now requires alongside the
+owner/repo slug):
 
 ```bash
 GITHUB_OWNER=<org-or-user> GITHUB_REPO=<repo-name> \
@@ -300,14 +311,19 @@ CONTAINER_APP_NAME=commerce-intelligence-api \
 This creates an Azure AD app registration trusted via OIDC federated
 credentials (no client secret stored anywhere). Since `rg-commerce-dev` is
 shared with `commerce-operations-api`, the grant is scoped as narrowly as
-Azure allows: `Reader` on the resource group (so Bicep's `existing` lookups
-and `az deployment group show` work), `AcrPush` on the registry (push-only;
-ACR has no per-repository scoping to narrow further), and
-`Container Apps Contributor` scoped to just the `commerce-intelligence-api`
-Container App — this identity can never touch `commerce-operations-api`, the
-shared Postgres server, Key Vault, or storage account. The script prints the
-exact GitHub repo secrets/variables to set from its output. Then, in the
-repo's Settings:
+Azure allows — four grants, deliberately never `Contributor` on the resource
+group:
+
+| Grant | Scope | Why |
+|---|---|---|
+| `Reader` | resource group | Bicep `existing` lookups, `az deployment group show` |
+| `AcrPush` | the registry | push-only; ACR has no per-repository scoping to narrow further |
+| `Container Apps Contributor` | just `commerce-intelligence-api` | the only resource this identity actually writes to |
+| `Commerce Intelligence Deployment Submitter` (custom role) | resource group | `Microsoft.Resources/deployments/write` — submitting an ARM/Bicep deployment is a distinct permission from writing the resources inside it; also covers `Microsoft.App/managedEnvironments/join/action` and `Microsoft.ManagedIdentity/userAssignedIdentities/assign/action`, both "linked authorization" checks Azure evaluates on the *referenced* environment/identity, not the Container App being written |
+
+This identity can never touch `commerce-operations-api`, the shared Postgres
+server, Key Vault, or storage account. The script prints the exact GitHub
+repo secrets/variables to set from its output. Then, in the repo's Settings:
 
 - **Environments** → create `dev` (no protection rules) and `production`
   (add required reviewers — this is the manual-approval gate).
