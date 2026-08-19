@@ -101,12 +101,20 @@ Requires Python 3.11+ and a running Postgres.
 cp .env.example .env               # edit DATABASE_URL if not using the defaults
 pip install -e ".[dev,ui]"
 
-alembic upgrade head               # create the schema
-uvicorn app.main:app --reload      # API on :8000
+alembic upgrade head                       # create the schema
+python -m uvicorn app.main:app --reload    # API on :8000
 
 # in another terminal
-streamlit run ui/app.py            # dashboard on :8501
+python -m streamlit run ui/app.py          # dashboard on :8501
 ```
+
+`python -m <tool>` (rather than the bare `uvicorn`/`streamlit` commands) sidesteps a
+real, fairly common issue on Windows: pip installs a console-script `.exe` per
+package, but not every Python install/package manager combination puts (or
+keeps) all of them on `PATH` — `streamlit.exe` in particular can end up
+installed but unreachable as a bare command even though `uvicorn`/`alembic`
+work fine side by side. `python -m` always finds it, since it goes through
+the interpreter that has the package importable rather than through `PATH`.
 
 Then verify the API's up: `curl http://localhost:8000/health` and
 `curl http://localhost:8000/ready`.
