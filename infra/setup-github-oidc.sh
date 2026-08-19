@@ -24,6 +24,13 @@
 
 set -euo pipefail
 
+# On Git Bash for Windows, MSYS auto-converts leading-slash arguments (like
+# Azure resource IDs — "/subscriptions/...") into Windows paths before az.cmd
+# ever sees them, silently corrupting every --scope value below and making
+# `az role assignment create` fail with a confusing "MissingSubscription"
+# error. Harmless no-op on Linux/macOS bash and real MSYS builds of bash.
+export MSYS_NO_PATHCONV=1
+
 : "${GITHUB_OWNER:?Set GITHUB_OWNER (the GitHub org or user that owns the repo)}"
 : "${GITHUB_REPO:?Set GITHUB_REPO (repo name only, no owner prefix)}"
 : "${RESOURCE_GROUP:?Set RESOURCE_GROUP (e.g. rg-commerce-dev)}"
@@ -70,13 +77,34 @@ create_fic "dev-environment"    "repo:${GITHUB_OWNER}/${GITHUB_REPO}:environment
 create_fic "prod-environment"   "repo:${GITHUB_OWNER}/${GITHUB_REPO}:environment:production"
 
 echo "=== RBAC (scoped to this app only — rg-commerce-dev is shared) ==="
+# --assignee-object-id + --assignee-principal-type (not --assignee <appId>) —
+# the appId form routes through a Graph lookup that has proven unreliable
+# from some shells/environments; resolving the SP's object id ourselves and
+# passing it directly avoids that entirely.
+SP_OBJECT_ID=$(az ad sp show --id "$APP_ID" --query id -o tsv)
 RG_ID="/subscriptions/${SUBSCRIPTION_ID}/resourceGroups/${RESOURCE_GROUP}"
 ACR_ID=$(az acr show -g "$RESOURCE_GROUP" -n "$ACR_NAME" --query id -o tsv)
 CONTAINER_APP_ID=$(az containerapp show -g "$RESOURCE_GROUP" -n "$CONTAINER_APP_NAME" --query id -o tsv)
 
-az role assignment create --role Reader --assignee "$APP_ID" --scope "$RG_ID" -o none || echo "  Reader already assigned"
-az role assignment create --role AcrPush --assignee "$APP_ID" --scope "$ACR_ID" -o none || echo "  AcrPush already assigned"
-az role assignment create --role "Container Apps Contributor" --assignee "$APP_ID" --scope "$CONTAINER_APP_ID" -o none || echo "  Container Apps Contributor already assigned"
+# A real failure must surface, not just get swallowed as "must already
+# exist" — only the specific RoleAssignmentExists condition is actually
+# benign here.
+assign_role() {
+  local role=$1 scope=$2
+  local output
+  if output=$(az role assignment create --role "$role" --assignee-object-id "$SP_OBJECT_ID" --assignee-principal-type ServicePrincipal --scope "$scope" 2>&1); then
+    echo "  granted $role"
+  elif echo "$output" | grep -q "RoleAssignmentExists"; then
+    echo "  $role already assigned"
+  else
+    echo "  FAILED to grant $role:" >&2
+    echo "$output" >&2
+    exit 1
+  fi
+}
+assign_role "Reader" "$RG_ID"
+assign_role "AcrPush" "$ACR_ID"
+assign_role "Container Apps Contributor" "$CONTAINER_APP_ID"
 
 ACR_LOGIN_SERVER=$(az acr show -g "$RESOURCE_GROUP" -n "$ACR_NAME" --query loginServer -o tsv)
 
