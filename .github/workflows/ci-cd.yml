@@ -1,0 +1,148 @@
+name: CI/CD
+
+# Test on every push/PR; build, tag, push, and deploy only on pushes to main.
+# DEV deploys automatically; PROD sits behind the "production" GitHub
+# Environment, which required-reviewer protection makes a manual-approval
+# gate (see README.md's "Setting up CI/CD" for the one-time setup this
+# workflow depends on — Azure OIDC federated credential, RBAC, repo
+# secrets/variables, and the environment protection rule itself, none of
+# which a workflow file can configure on its own).
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  id-token: write   # required for OIDC login to Azure (azure/login) — no stored client secret
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: ai_commerce
+          POSTGRES_PASSWORD: ai_commerce
+          POSTGRES_DB: ai_commerce_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U ai_commerce -d ai_commerce_test"
+          --health-interval 5s --health-timeout 5s --health-retries 10
+    env:
+      TEST_DATABASE_URL: postgresql+psycopg://ai_commerce:ai_commerce@localhost:5432/ai_commerce_test
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - run: pip install -e ".[dev,ui]"
+
+      - run: ruff check app tests
+
+      - run: pytest -m "not smoke"   # unit + integration; smoke needs a live deployment, not this runner
+
+  build-and-push:
+    needs: test
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    outputs:
+      image-tag: ${{ steps.meta.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Compute image tag (app version + short commit SHA)
+        id: meta
+        run: |
+          VERSION=$(python -c "import tomllib; print(tomllib.load(open('pyproject.toml','rb'))['project']['version'])")
+          echo "tag=${VERSION}-${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+
+      - uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - run: az acr login --name ${{ vars.ACR_NAME }}
+
+      - name: Build and push
+        run: |
+          IMAGE="${{ vars.ACR_LOGIN_SERVER }}/commerce-intelligence-api"
+          docker build -f docker/api.Dockerfile \
+            -t "$IMAGE:${{ steps.meta.outputs.tag }}" \
+            -t "$IMAGE:${{ github.sha }}" \
+            .
+          docker push "$IMAGE:${{ steps.meta.outputs.tag }}"
+          docker push "$IMAGE:${{ github.sha }}"
+
+  deploy-dev:
+    needs: build-and-push
+    runs-on: ubuntu-latest
+    environment: dev   # no required reviewers — deploys automatically on merge to main
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - run: |
+          az deployment group create -g ${{ vars.AZURE_RESOURCE_GROUP }} -f infra/app.bicep \
+            -p infra/app.parameters.dev.json \
+            imageTag=${{ needs.build-and-push.outputs.image-tag }} \
+            uniqueSuffix=${{ vars.UNIQUE_SUFFIX }} \
+            acrNameOverride=${{ vars.ACR_NAME }}
+
+      - run: |
+          FQDN=$(az deployment group show -g ${{ vars.AZURE_RESOURCE_GROUP }} -n app --query properties.outputs.containerAppFqdn.value -o tsv)
+          echo "Deployed: https://$FQDN"
+          curl -sf "https://$FQDN/health" && curl -sf "https://$FQDN/ready"
+
+  deploy-prod:
+    needs: deploy-dev
+    runs-on: ubuntu-latest
+    # "production" environment: configure required reviewers under this repo's
+    # Settings -> Environments -> production. That approval gate is what makes
+    # this a manual step — the workflow file itself can't create it.
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Skip cleanly if PROD infra isn't provisioned yet
+        id: guard
+        run: |
+          if [ -z "${{ vars.PROD_AZURE_RESOURCE_GROUP }}" ]; then
+            echo "PROD_AZURE_RESOURCE_GROUP is not set — PROD infrastructure hasn't been provisioned yet (see README.md's 'Deploying to Azure (PROD)'). Skipping deploy-prod."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: azure/login@v2
+        if: steps.guard.outputs.skip == 'false'
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - if: steps.guard.outputs.skip == 'false'
+        run: |
+          az deployment group create -g ${{ vars.PROD_AZURE_RESOURCE_GROUP }} -f infra/app.bicep \
+            -p infra/app.parameters.prod.json \
+            imageTag=${{ needs.build-and-push.outputs.image-tag }} \
+            uniqueSuffix=${{ vars.PROD_UNIQUE_SUFFIX }} \
+            acrNameOverride=${{ vars.ACR_NAME }}
