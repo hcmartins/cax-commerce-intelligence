@@ -5,13 +5,28 @@
 #
 # rg-commerce-dev is a SHARED resource group (commerce-operations-api and its
 # own infra live in it too), so this deliberately grants the narrowest scope
-# that works: Reader on the resource group (needed for Bicep `existing`
-# lookups and `az deployment group show`), Container Apps Contributor scoped
-# to just this app's own Container App (not the whole environment or any
-# other service's), and AcrPush on the shared registry (push-only, and the
-# registry has no per-repository scoping to narrow further). This identity
-# can never touch commerce-operations-api, the shared Postgres server, Key
-# Vault, or storage account.
+# that works — four grants, none of them "Contributor" on the resource group:
+#   - Reader on the resource group (Bicep `existing` lookups, `az deployment
+#     group show`)
+#   - AcrPush on the shared registry (push-only; ACR has no per-repository
+#     scoping to narrow further)
+#   - Container Apps Contributor scoped to just this app's own Container App
+#     (not the whole environment or any other service's)
+#   - a custom "Commerce Intelligence Deployment Submitter" role, because
+#     none of the above actually covers submitting an ARM/Bicep deployment:
+#     `Microsoft.Resources/deployments/write` is a distinct permission
+#     surface from the resource writes inside it, and deploying
+#     infra/app.bicep specifically also needs
+#     `Microsoft.App/managedEnvironments/join/action` (attaching the
+#     Container App to the shared environment) and
+#     `Microsoft.ManagedIdentity/userAssignedIdentities/assign/action`
+#     (attaching this app's own identity to it) — both "linked
+#     authorization" checks Azure evaluates on the *referenced* resource,
+#     not the one being written. Every one of these was found the hard way,
+#     by actually running a deployment and reading what AuthorizationFailed/
+#     LinkedAuthorizationFailed said was missing — this identity can still
+#     never touch commerce-operations-api, the shared Postgres server, Key
+#     Vault, or storage account.
 #
 # Run once per repo, after the GitHub repository exists (the federated
 # credentials below are scoped to its exact owner/name — plus their stable
@@ -139,6 +154,49 @@ assign_role() {
 assign_role "Reader" "$RG_ID"
 assign_role "AcrPush" "$ACR_ID"
 assign_role "Container Apps Contributor" "$CONTAINER_APP_ID"
+
+echo "=== Custom role: deployment submission + linked-resource actions ==="
+CUSTOM_ROLE_NAME="Commerce Intelligence Deployment Submitter"
+ROLE_DEF_FILE=$(mktemp)
+cat > "$ROLE_DEF_FILE" <<EOF
+{
+  "Name": "$CUSTOM_ROLE_NAME",
+  "Description": "Lets a CI/CD identity submit ARM/Bicep deployments in this resource group, join the shared Container Apps environment, and assign this app's managed identity to its own Container App; actual resource writes are still governed by that identity's other, resource-scoped role assignments.",
+  "Actions": [
+    "Microsoft.Resources/deployments/write",
+    "Microsoft.Resources/deployments/read",
+    "Microsoft.Resources/deployments/delete",
+    "Microsoft.Resources/deployments/validate/action",
+    "Microsoft.Resources/deployments/operations/read",
+    "Microsoft.Resources/deployments/exportTemplate/action",
+    "Microsoft.App/managedEnvironments/join/action",
+    "Microsoft.ManagedIdentity/userAssignedIdentities/assign/action"
+  ],
+  "NotActions": [],
+  "AssignableScopes": ["$RG_ID"]
+}
+EOF
+# On Git Bash, az.cmd is a native Windows program — it can't resolve a plain
+# MSYS-style /tmp/... path (and MSYS_NO_PATHCONV above deliberately stops
+# bash from auto-translating it). cygpath -w gives it the real Windows path
+# instead; a no-op elsewhere, where the plain path already works.
+if command -v cygpath >/dev/null; then
+  ROLE_DEF_FILE_ARG=$(cygpath -w "$ROLE_DEF_FILE")
+else
+  ROLE_DEF_FILE_ARG="$ROLE_DEF_FILE"
+fi
+
+EXISTING_ROLE_ID=$(az role definition list --custom-role-only true --query "[?roleName=='$CUSTOM_ROLE_NAME'].id | [0]" -o tsv)
+if [ -z "$EXISTING_ROLE_ID" ]; then
+  ROLE_DEF_ID=$(az role definition create --role-definition "$ROLE_DEF_FILE_ARG" --query id -o tsv)
+  echo "  created role definition"
+else
+  az role definition update --role-definition "$ROLE_DEF_FILE_ARG" >/dev/null
+  ROLE_DEF_ID="$EXISTING_ROLE_ID"
+  echo "  updated existing role definition"
+fi
+rm -f "$ROLE_DEF_FILE"
+assign_role "$ROLE_DEF_ID" "$RG_ID"
 
 ACR_LOGIN_SERVER=$(az acr show -g "$RESOURCE_GROUP" -n "$ACR_NAME" --query loginServer -o tsv)
 
